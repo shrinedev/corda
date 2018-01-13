@@ -73,7 +73,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.concurrent.thread
 
 class DriverDSLImpl(
         val portAllocation: PortAllocation,
@@ -135,6 +134,7 @@ class DriverDSLImpl(
     }
 
     override fun shutdown() {
+        log.info("Shutting down driver...")
         if (waitForNodesToFinish) {
             state.locked {
                 processes.forEach { it.waitFor() }
@@ -161,7 +161,7 @@ class DriverDSLImpl(
                 throw ListenProcessDeathException(rpcAddress, processDeathFuture.getOrThrow())
             }
             val connection = connectionFuture.getOrThrow()
-            shutdownManager.registerShutdown(connection::close)
+            shutdownManager.registerShutdown("RPC for ${config.corda.myLegalName.organisation}", connection::close)
             connection.proxy
         }
     }
@@ -346,7 +346,7 @@ class DriverDSLImpl(
     override fun startWebserver(handle: NodeHandle, maximumHeapSize: String): CordaFuture<WebserverHandle> {
         val debugPort = if (isDebug) debugPortAllocation.nextPort() else null
         val process = startWebserver(handle, debugPort, maximumHeapSize)
-        shutdownManager.registerProcessShutdown(process)
+        shutdownManager.registerProcessShutdown("webserver for ${handle.configuration.myLegalName.organisation}", process)
         val webReadyFuture = addressMustBeBoundFuture(executorService, handle.webAddress, process)
         return webReadyFuture.map { queryWebserver(handle, process) }
     }
@@ -610,16 +610,7 @@ class DriverDSLImpl(
             countObservables.remove(config.corda.myLegalName)
         }
         if (startInProcess ?: startNodesInProcess) {
-            val nodeAndThreadFuture = startInProcessNode(executorService, config, cordappPackages)
-            shutdownManager.registerShutdown(
-                    nodeAndThreadFuture.map { (node, thread) ->
-                        {
-                            node.dispose()
-                            thread.interrupt()
-                        }
-                    }
-            )
-            return nodeAndThreadFuture.flatMap { (node, thread) ->
+            return startInProcessNode(config).flatMap { (node, thread) ->
                 establishRpc(config, openFuture()).flatMap { rpc ->
                     allNodesConnected(rpc).map {
                         NodeHandle.InProcess(rpc.nodeInfo(), rpc, config.corda, webAddress, node, thread, onNodeExit)
@@ -635,7 +626,7 @@ class DriverDSLImpl(
                     processes += process
                 }
             } else {
-                shutdownManager.registerProcessShutdown(process)
+                shutdownManager.registerProcessShutdown("out-of-process ${config.corda.myLegalName.organisation}", process)
             }
             val p2pReadyFuture = addressMustBeBoundFuture(executorService, config.corda.p2pAddress, process)
             return p2pReadyFuture.flatMap {
@@ -660,8 +651,38 @@ class DriverDSLImpl(
 
     override fun <A> pollUntilNonNull(pollName: String, pollInterval: Duration, warnCount: Int, check: () -> A?): CordaFuture<A> {
         val pollFuture = poll(executorService, pollName, pollInterval, warnCount, check)
-        shutdownManager.registerShutdown { pollFuture.cancel(true) }
+        shutdownManager.registerShutdown(pollName) { pollFuture.cancel(true) }
         return pollFuture
+    }
+
+    private fun startInProcessNode(config: NodeConfig): CordaFuture<Pair<StartedNode<Node>, Thread>> {
+        val startedNodeFuture = openFuture<StartedNode<Node>>()
+
+        val thread = object : Thread(config.corda.myLegalName.organisation) {
+            override fun run() {
+                try {
+                    log.info("Starting in-process Node ${config.corda.myLegalName.organisation}")
+                    // Write node.conf
+                    writeConfig(config.corda.baseDirectory, "node.conf", config.typesafe)
+                    // TODO pass the version in?
+                    val node = InProcessNode(config.corda, MOCK_VERSION_INFO, cordappPackages).start()
+
+                    shutdownManager.registerShutdown("in-process ${config.corda.myLegalName.organisation}") {
+                        node.dispose()
+                        join()
+                    }
+
+                    startedNodeFuture.set(node)
+                    node.internals.run() // This blocks the thread until the node is terminated
+                } catch (t: Throwable) {
+                    startedNodeFuture.setException(t)
+                }
+            }
+        }.apply { start() }
+
+        return startedNodeFuture.flatMap { node ->
+            addressMustBeBoundFuture(executorService, config.corda.p2pAddress).map { Pair(node, thread) }
+        }
     }
 
     /**
@@ -672,7 +693,9 @@ class DriverDSLImpl(
         // TODO: this object will copy NodeInfo files from started nodes to other nodes additional-node-infos/
         // This uses the FileSystem and adds a delay (~5 seconds) given by the time we wait before polling the file system.
         // Investigate whether we can avoid that.
-        val nodeInfosCopier = NodeInfoFilesCopier().also { shutdownManager.registerShutdown(it::close) }
+        val nodeInfosCopier = NodeInfoFilesCopier().also {
+            shutdownManager.registerShutdown("node-info files copier", it::close)
+        }
     }
 
     /**
@@ -707,26 +730,6 @@ class DriverDSLImpl(
         )
 
         private fun <A> oneOf(array: Array<A>) = array[Random().nextInt(array.size)]
-
-        private fun startInProcessNode(
-                executorService: ScheduledExecutorService,
-                config: NodeConfig,
-                cordappPackages: List<String>
-        ): CordaFuture<Pair<StartedNode<Node>, Thread>> {
-            return executorService.fork {
-                log.info("Starting in-process Node ${config.corda.myLegalName.organisation}")
-                // Write node.conf
-                writeConfig(config.corda.baseDirectory, "node.conf", config.typesafe)
-                // TODO pass the version in?
-                val node = InProcessNode(config.corda, MOCK_VERSION_INFO, cordappPackages).start()
-                val nodeThread = thread(name = config.corda.myLegalName.organisation) {
-                    node.internals.run()
-                }
-                node to nodeThread
-            }.flatMap { nodeAndThread ->
-                addressMustBeBoundFuture(executorService, config.corda.p2pAddress).map { nodeAndThread }
-            }
-        }
 
         private fun startOutOfProcessNode(
                 config: NodeConfig,
